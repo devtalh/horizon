@@ -257,9 +257,7 @@ pub(super) struct LanHost {
     /// Guests' commands waiting for the hub to be back in `self.lan`, where
     /// a command can reach every player (game/lan_actions.rs).
     pub commands: Vec<super::lan_actions::GuestCommand>,
-    /// Guests' blows on End crystals waiting for the hub to be back in
-    /// `self.lan`, as (connection, entity id): the blast hurts every player
-    /// (game/lan_actions.rs).
+    /// Guests' crystal blows waiting for the hub (game/lan_pvp.rs).
     pub strikes: Vec<(u32, i32)>,
     /// Mods' quiet commands waiting to run a few a tick (game/lan_quiet.rs).
     pub quiet: std::collections::VecDeque<super::lan_quiet::QuietBatch>,
@@ -2390,16 +2388,7 @@ impl Game<'_> {
                 }
                 HostEvent::Packet(conn, packet) => {
                     self.lan_guest_packet(&mut host, conn, *packet);
-                    if !host.commands.is_empty() {
-                        self.lan = Some(host);
-                        self.run_guest_commands();
-                        host = self.lan.take().expect("the hub is back after the commands");
-                    }
-                    if !host.strikes.is_empty() {
-                        self.lan = Some(host);
-                        self.run_guest_strikes();
-                        host = self.lan.take().expect("the hub is back after the strikes");
-                    }
+                    host = self.run_guest_queues(host);
                 }
                 HostEvent::Jump { conn, from, yaw } => {
                     self.guest_jump(&mut host, conn, from, yaw);
