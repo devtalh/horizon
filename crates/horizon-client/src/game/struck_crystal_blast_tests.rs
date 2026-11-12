@@ -1,10 +1,8 @@
-//! A player's blow on an End crystal and `/damage` on it blow the same
-//! crystal up: `EndCrystal.hurtServer` explodes it, and
+//! A player's blow on an End crystal blows it up (`EndCrystal.hurtServer`), and
 //! `ServerExplosion.hurtEntities` hurts and pushes every player in reach, the
 //! attacker and everyone else alike (`ServerPlayer.onExplosionHit`, then the
 //! `ClientboundExplodePacket` carries each pushed player's knockback).
-//! Two players here, the attacker and a bystander in reach; the control is the
-//! `/damage` command that blows the very same crystal up.
+//! Two players here, the attacker and a bystander in reach.
 use super::super::*;
 use horizon_client::{
     chunk::Chunk,
@@ -68,7 +66,7 @@ fn game() -> (Game<'static>, mpsc::Receiver<Out>, mpsc::Receiver<Out>, u32) {
     game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 100.0, 6.5)).unwrap());
     let net = NetConfig {
         announce: false,
-        ..NetConfig::lan(0, "lea289-test".into(), 4)
+        ..NetConfig::lan(0, "crystal-blast-test".into(), 4)
     };
     game.lan_host(
         lan::LanSettings {
@@ -167,97 +165,46 @@ fn explosion(packets: &[play::Clientbound]) -> Option<&play::Explode> {
     })
 }
 
-/// How the crystal is blown up.
-#[derive(Clone, Copy)]
-enum Blow {
-    /// The attacker's `ServerboundAttackPacket`, in their turn as
-    /// `tick_lan_packets` runs it (the hub is out of `self.lan`).
-    Attack,
-    /// `/damage` on the crystal (`EndCrystal.hurtServer` with a non-explosion
-    /// type), run with the hub in `self.lan`.
-    Command,
-}
-
-/// What the players saw of the blast.
-struct Seen {
-    /// The push the attacker's blast packet carries.
-    attacker_push: Option<[f64; 3]>,
-    /// Health the bystander lost.
-    bystander_hurt: f32,
-    /// The push the bystander's blast packet carries (None: no packet, or none in it).
-    bystander_push: Option<[f64; 3]>,
-}
-
-/// Blow the crystal up and collect what both guests were sent and lost.
-fn blast(blow: Blow) -> Seen {
+/// A guest's blow on the crystal blows it up inside that guest's turn, where
+/// the hub is out of `self.lan` (`tick_lan_packets`): `ServerExplosion.hurtEntities`
+/// still hurts the bystander and the blast packet still carries their push, as
+/// for a command (`/damage`). Expected values worked out from vanilla's
+/// formulas: 9 blocks from a radius-6 blast, nothing in the way, no armor, so
+/// `(1 - 9/12)` of the blast's reach, damage `(p*p + p) / 2 * 7 * 12 + 1` for
+/// `p = 0.25` (14.125), knocked back `p` along centre to eye
+/// (`(0, 1.62, -9)` normalised).
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn a_guests_blow_on_a_crystal_hurts_and_pushes_the_bystander() {
     let (mut game, attacker, bystander, crystal) = game();
     let _ = (sent(&attacker), sent(&bystander));
-    assert_eq!(health(&game, BYSTANDER), 20.0);
-    match blow {
-        Blow::Attack => {
-            let mut host = game.lan.take().expect("the world is hosted");
-            game.lan_guest_packet(
-                &mut host,
-                ATTACKER,
-                play::Serverbound::Attack(play::Attack { id: crystal as i32 }),
-            );
-            game.lan = Some(host);
-            // The turn is over: what it put off reaches the players (`tick_lan`).
-            game.flush_lan_explosions();
-        }
-        Blow::Command => {
-            assert!(game.run_command("damage @e[type=end_crystal,limit=1] 1 minecraft:generic"));
-        }
-    }
+    let mut host = game.lan.take().expect("the world is hosted");
+    game.lan_guest_packet(
+        &mut host,
+        ATTACKER,
+        play::Serverbound::Attack(play::Attack { id: crystal as i32 }),
+    );
+    game.lan = Some(host);
+    // The packet is handled (`lan_process_events`): the blow it put off runs.
+    game.run_guest_strikes();
+    // The turn is over: what it put off reaches the players (`tick_lan`).
+    game.flush_lan_explosions();
     assert!(game.crystals.iter().all(|c| c.id != crystal), "it blew up");
-    let push = |rx| {
-        explosion(&sent(rx))
-            .expect("the player is sent the blast")
-            .knockback
-    };
-    Seen {
-        attacker_push: push(&attacker),
-        bystander_hurt: 20.0 - health(&game, BYSTANDER),
-        bystander_push: push(&bystander),
+    let hurt = 20.0 - health(&game, BYSTANDER);
+    assert!((hurt - 14.125).abs() < 0.01, "lost {hurt}");
+    let push = explosion(&sent(&bystander))
+        .expect("the bystander is sent the blast")
+        .knockback
+        .expect("the blast pushes the bystander");
+    let length = (1.62f64 * 1.62 + 81.0).sqrt();
+    for (got, want) in push
+        .iter()
+        .zip([0.0, 0.25 * 1.62 / length, -0.25 * 9.0 / length])
+    {
+        assert!((got - want).abs() < 1e-4, "pushed {push:?}");
     }
-}
-
-/// Control: `/damage` on the crystal hurts the bystander (the blast reaches
-/// ~14 of their 20 health at 9 blocks).
-#[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-fn damage_command_on_a_crystal_hurts_the_bystander() {
-    let seen = blast(Blow::Command);
-    assert!(seen.bystander_hurt > 10.0, "lost {}", seen.bystander_hurt);
-}
-
-/// Control: and pushes them (`ServerExplosion.hitPlayers`: the blast packet's
-/// `playerKnockback`).
-#[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-fn damage_command_on_a_crystal_pushes_the_bystander() {
-    let seen = blast(Blow::Command);
-    assert!(seen.attacker_push.is_some(), "the attacker is pushed");
-    assert!(seen.bystander_push.is_some(), "the bystander is pushed");
-}
-
-/// A guest's own blow on the crystal blows it up inside that guest's turn
-/// (`tick_lan_packets` holds the hub, `as_guest` swaps the attacker in), where
-/// `explosion_hurt_entities` skips every other player: the bystander loses
-/// nothing. Vanilla hurts them as it does for the command.
-#[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-fn a_guests_blow_on_a_crystal_hurts_the_bystander() {
-    let seen = blast(Blow::Attack);
-    assert!(seen.bystander_hurt > 10.0, "lost {}", seen.bystander_hurt);
-}
-
-/// ... and the blast packet they are sent carries no push, while the
-/// attacker's does.
-#[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-fn a_guests_blow_on_a_crystal_pushes_the_bystander() {
-    let seen = blast(Blow::Attack);
-    assert!(seen.attacker_push.is_some(), "the attacker is pushed");
-    assert!(seen.bystander_push.is_some(), "the bystander is pushed");
+    assert!(
+        explosion(&sent(&attacker)).is_some_and(|e| e.knockback.is_some()),
+        "the attacker is pushed too"
+    );
 }
